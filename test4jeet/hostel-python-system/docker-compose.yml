@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: hostel-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: karan123
+      MYSQL_DATABASE: hostel_db
+      MYSQL_USER: hostel_user
+      MYSQL_PASSWORD: hostel123
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
