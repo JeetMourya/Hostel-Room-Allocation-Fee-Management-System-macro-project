@@ -1,34 +1,10 @@
-﻿from flask import Flask, jsonify, request
-from flask_cors import CORS
-from database import db
-import datetime
+﻿from app import create_app
 
-app = Flask(__name__)
-CORS(app)
+app = create_app()
 
-@app.route('/')
-def home():
-    return jsonify({
-        "message": "Hostel Management System API",
-        "version": "1.0.0",
-        "endpoints": {
-            "health": "/health",
-            "rooms": "/rooms",
-            "students": "/students",
-            "allocations": "/allocations",
-            "fees": "/fees",
-            "analytics": "/analytics"
-        }
-    })
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
 
-@app.route('/health', methods=['GET'])
-def health():
-    db_status = "Connected" if db.health_check() else "Disconnected"
-    return jsonify({
-        "status": "Running",
-        "database": db_status,
-        "timestamp": datetime.datetime.now().isoformat()
-    })
 
 # Room Management
 @app.route('/rooms', methods=['GET'])
