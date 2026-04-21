@@ -145,6 +145,20 @@ def init_database():
         check_out   TIMESTAMP,
         FOREIGN KEY (student_id) REFERENCES students(id)
     );
+
+    CREATE TABLE IF NOT EXISTS student_verifications (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        verify_code   TEXT UNIQUE NOT NULL,
+        student_type  TEXT NOT NULL DEFAULT 'fresher',
+        name          TEXT NOT NULL,
+        email         TEXT,
+        course        TEXT,
+        year          INTEGER DEFAULT 1,
+        gender        TEXT DEFAULT 'Male',
+        is_registered INTEGER DEFAULT 0,
+        registered_at TIMESTAMP,
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     ''')
 
     # Seed users
@@ -203,6 +217,19 @@ def init_database():
             ("Water Supply Maintenance","Water supply will be shut on 28 Feb from 10AM–2PM.","Maintenance","Normal","2026-03-01"),
             ("Visitors Policy","Visitors allowed only between 9AM–7PM on working days.","General","Normal","2026-12-31")
         ''')
+
+    # Seed pre-approved verifications for self-registration
+    c.execute("SELECT COUNT(*) FROM student_verifications")
+    if c.fetchone()[0] == 0:
+        verifs = [
+            ('ADM2026001', 'fresher',  'Ravi Verma',    'ravi@college.edu',    'B.Tech CSE', 1, 'Male'),
+            ('ADM2026002', 'fresher',  'Sakshi Jain',   'sakshi@college.edu',  'B.Tech ECE', 1, 'Female'),
+            ('ADM2026003', 'fresher',  'Arjun Mehta',   'arjun@college.edu',   'BCA',        1, 'Male'),
+            ('ADM2026004', 'fresher',  'Neha Gupta',    'neha@college.edu',    'B.Sc IT',    1, 'Female'),
+            ('S004',       'existing', 'Sneha Patel',   'sneha@college.edu',   'BCA',        1, 'Female'),
+        ]
+        c.executemany('''INSERT INTO student_verifications
+            (verify_code,student_type,name,email,course,year,gender) VALUES (?,?,?,?,?,?,?)''', verifs)
 
     conn.commit()
     conn.close()
@@ -664,6 +691,92 @@ def api_visitor_checkout(vid):
     conn.close()
     return jsonify({'message': 'Visitor checked out'})
 
+# ─── API: STUDENT VERIFICATIONS (ADMIN) ────────────────────────────────────────
+
+@app.route('/api/verifications', methods=['GET'])
+def api_get_verifications():
+    conn = get_db()
+    rows = rows_to_list(conn.execute("SELECT * FROM student_verifications ORDER BY created_at DESC").fetchall())
+    conn.close()
+    return jsonify(rows)
+
+@app.route('/api/verifications', methods=['POST'])
+def api_add_verification():
+    d = request.json
+    if not d.get('verify_code') or not d.get('name'):
+        return jsonify({'error': 'verify_code and name are required'}), 400
+    conn = get_db()
+    try:
+        conn.execute('''INSERT INTO student_verifications
+            (verify_code,student_type,name,email,course,year,gender) VALUES (?,?,?,?,?,?,?)''',
+            (d['verify_code'], d.get('student_type','fresher'), d['name'],
+             d.get('email'), d.get('course'), d.get('year',1), d.get('gender','Male')))
+        conn.commit(); conn.close()
+        return jsonify({'message': 'Verification record added'}), 201
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({'error': 'Verify code already exists'}), 409
+
+@app.route('/api/verifications/<int:vid>', methods=['DELETE'])
+def api_delete_verification(vid):
+    conn = get_db()
+    conn.execute("DELETE FROM student_verifications WHERE id=? AND is_registered=0", (vid,))
+    conn.commit(); conn.close()
+    return jsonify({'message': 'Deleted'})
+
+# ─── API: SELF-REGISTRATION (PUBLIC) ────────────────────────────────────────────
+
+@app.route('/api/verify-identity', methods=['POST'])
+def api_verify_identity():
+    d    = request.json
+    code = (d.get('verify_code') or '').strip()
+    if not code:
+        return jsonify({'error': 'Verification code is required'}), 400
+    conn = get_db()
+    v = conn.execute("SELECT * FROM student_verifications WHERE verify_code=?", (code,)).fetchone()
+    conn.close()
+    if not v:
+        return jsonify({'error': 'Invalid code. Please contact hostel administration.'}), 404
+    if v['is_registered']:
+        return jsonify({'error': 'This code was already used. Please login or contact admin.'}), 409
+    return jsonify({'id': v['id'], 'name': v['name'], 'email': v['email'] or '',
+                    'course': v['course'] or '', 'year': v['year'], 'gender': v['gender'],
+                    'student_type': v['student_type'], 'verify_code': v['verify_code']})
+
+@app.route('/api/self-register', methods=['POST'])
+def api_self_register():
+    d = request.json
+    for f in ['verify_code','username','password','name','email']:
+        if not d.get(f):
+            return jsonify({'error': f'{f} is required'}), 400
+    conn = get_db()
+    v = conn.execute("SELECT * FROM student_verifications WHERE verify_code=?", (d['verify_code'],)).fetchone()
+    if not v:
+        conn.close(); return jsonify({'error': 'Invalid verification code'}), 400
+    if v['is_registered']:
+        conn.close(); return jsonify({'error': 'Code already used. Please login.'}), 409
+    if conn.execute("SELECT id FROM users WHERE username=?", (d['username'],)).fetchone():
+        conn.close(); return jsonify({'error': 'Username already taken. Choose another.'}), 409
+    count = conn.execute("SELECT COUNT(*) FROM students").fetchone()[0]
+    sid   = d['verify_code'] if v['student_type'] == 'existing' else f"STU{str(count+1).zfill(4)}"
+    try:
+        conn.execute('''INSERT INTO students
+            (student_id,name,email,phone,gender,dob,address,guardian_name,guardian_phone,course,year)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+            (sid, d['name'], d['email'], d.get('phone'), d.get('gender', v['gender'] or 'Male'),
+             d.get('dob'), d.get('address'), d.get('guardian_name'), d.get('guardian_phone'),
+             d.get('course', v['course']), d.get('year', v['year'])))
+        new_id = conn.execute("SELECT id FROM students WHERE student_id=?", (sid,)).fetchone()['id']
+        conn.execute("INSERT INTO users (username,password,role,student_id,name) VALUES (?,?,?,?,?)",
+            (d['username'], hash_pw(d['password']), 'student', new_id, d['name']))
+        conn.execute("UPDATE student_verifications SET is_registered=1,registered_at=CURRENT_TIMESTAMP WHERE verify_code=?",
+            (d['verify_code'],))
+        conn.commit(); conn.close()
+        return jsonify({'message': 'Registration successful! You can now login.'}), 201
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({'error': 'Email or Student ID already exists. Contact admin.'}), 409
+
 # ─── AUTH ────────────────────────────────────────────────────────────────────
 
 def hash_pw(p): return hashlib.sha256(p.encode()).hexdigest()
@@ -728,6 +841,10 @@ def login_page():
     session.clear()
     return Response(LOGIN_HTML, mimetype='text/html')
 
+@app.route('/register')
+def register_page():
+    return Response(REGISTER_HTML, mimetype='text/html')
+
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -736,39 +853,62 @@ HTML = r"""<!DOCTYPE html>
 <title>Hostel Management System</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
 <style>
 :root{--sidebar-w:260px;--primary:#4f46e5;--primary-dark:#3730a3;--sidebar-bg:#1e1b4b;--sidebar-text:#c7d2fe;}
 *{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:'Segoe UI',sans-serif;background:#f1f5f9;color:#1e293b;}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#f1f5f9;color:#1e293b;}
 /* Sidebar */
 #sidebar{position:fixed;top:0;left:0;height:100vh;width:var(--sidebar-w);background:var(--sidebar-bg);overflow-y:auto;z-index:1000;transition:.3s;}
-#sidebar .brand{padding:20px 20px 10px;border-bottom:1px solid rgba(255,255,255,.1);}
-#sidebar .brand h5{color:#fff;font-weight:700;font-size:1rem;}
-#sidebar .brand small{color:var(--sidebar-text);font-size:.75rem;}
-#sidebar .nav-section{padding:12px 16px 4px;font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:#6b7280;}
-#sidebar .nav-link{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--sidebar-text);border-radius:0;font-size:.875rem;transition:.2s;}
-#sidebar .nav-link:hover,#sidebar .nav-link.active{background:rgba(99,102,241,.25);color:#fff;}
-#sidebar .nav-link i{font-size:1rem;width:18px;}
+#sidebar .brand{padding:20px 20px 14px;border-bottom:1px solid rgba(255,255,255,.08);}
+#sidebar .brand h5{color:#fff;font-weight:700;font-size:1.05rem;letter-spacing:-.01em;}
+#sidebar .brand small{color:var(--sidebar-text);font-size:.72rem;}
+#sidebar .nav-section{padding:16px 20px 4px;font-size:.66rem;text-transform:uppercase;letter-spacing:.1em;color:#4b5563;font-weight:600;}
+#sidebar .nav-link{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--sidebar-text);border-radius:0;font-size:.86rem;transition:.2s;cursor:pointer;text-decoration:none;}
+#sidebar .nav-link:hover{background:rgba(99,102,241,.18);color:#e0e7ff;}
+#sidebar .nav-link.active{background:rgba(99,102,241,.3);color:#fff;border-right:3px solid #818cf8;}
+#sidebar .nav-link i{font-size:1rem;width:18px;text-align:center;}
 #sidebar .nav-link .badge{margin-left:auto;}
 /* Main */
 #main{margin-left:var(--sidebar-w);min-height:100vh;display:flex;flex-direction:column;}
-.topbar{background:#fff;padding:12px 24px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:100;}
-.topbar h6{font-weight:600;margin:0;flex:1;}
+.topbar{background:#fff;padding:12px 24px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:100;box-shadow:0 1px 3px rgba(0,0,0,.04);}
+.topbar h6{font-weight:700;margin:0;flex:1;font-size:.95rem;color:#0f172a;}
 .content{padding:24px;flex:1;}
-/* Cards */
-.stat-card{background:#fff;border-radius:12px;padding:20px;display:flex;align-items:center;gap:16px;box-shadow:0 1px 3px rgba(0,0,0,.08);}
-.stat-icon{width:52px;height:52px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:1.4rem;}
-.stat-card h3{font-size:1.6rem;font-weight:700;margin:0;}
-.stat-card p{color:#64748b;font-size:.82rem;margin:0;}
-.card{border:none;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.07);}
-.card-header{background:#fff;border-bottom:1px solid #f1f5f9;border-radius:12px 12px 0 0!important;padding:14px 20px;font-weight:600;font-size:.9rem;}
+/* Stat Cards */
+.stat-card{background:#fff;border-radius:14px;padding:18px 20px;display:flex;align-items:center;gap:14px;box-shadow:0 1px 4px rgba(0,0,0,.07);transition:transform .15s,box-shadow .15s;}
+.stat-card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.1);}
+.stat-icon{width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:1.3rem;flex-shrink:0;}
+.stat-card h3{font-size:1.55rem;font-weight:800;margin:0;letter-spacing:-.02em;}
+.stat-card p{color:#64748b;font-size:.78rem;margin:0;font-weight:500;}
+.stat-card .trend{font-size:.72rem;margin-top:2px;}
+/* Info Panel */
+.info-panel{background:#fff;border-radius:14px;box-shadow:0 1px 4px rgba(0,0,0,.07);overflow:hidden;}
+.info-panel .panel-header{padding:14px 18px;border-bottom:1px solid #f1f5f9;display:flex;align-items:center;justify-content:space-between;}
+.info-panel .panel-header h6{font-weight:700;font-size:.88rem;margin:0;color:#0f172a;}
+/* Occupancy Bar */
+.occ-bar-wrap{padding:14px 18px;display:flex;flex-direction:column;gap:10px;}
+.occ-item{display:flex;flex-direction:column;gap:4px;}
+.occ-label{display:flex;justify-content:space-between;font-size:.78rem;font-weight:600;color:#374151;}
+.occ-track{height:8px;background:#e2e8f0;border-radius:99px;overflow:hidden;}
+.occ-fill{height:100%;border-radius:99px;transition:width .6s ease;}
+/* Fee Summary Widget */
+.fee-stat{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;border-bottom:1px solid #f1f5f9;}
+.fee-stat:last-child{border-bottom:none;}
+.fee-stat-label{font-size:.8rem;font-weight:600;color:#64748b;}
+.fee-stat-val{font-size:1rem;font-weight:800;}
+/* Quick Action Bar */
+.quick-actions{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px;}
+.qa-btn{display:flex;align-items:center;gap:8px;padding:9px 16px;border-radius:10px;font-size:.83rem;font-weight:600;border:none;cursor:pointer;transition:.2s;}
+.qa-btn:hover{filter:brightness(.93);transform:translateY(-1px);}
+/* General Card */
+.card{border:none;border-radius:14px;box-shadow:0 1px 4px rgba(0,0,0,.07);}
+.card-header{background:#fff;border-bottom:1px solid #f1f5f9;border-radius:14px 14px 0 0!important;padding:13px 18px;font-weight:700;font-size:.88rem;color:#0f172a;}
 /* Page */
 .page{display:none;}.page.active{display:block;}
 /* Table */
 .table-responsive{border-radius:8px;overflow:hidden;}
-table th{font-size:.78rem;text-transform:uppercase;letter-spacing:.04em;color:#64748b;background:#f8fafc;font-weight:600;}
-table td{vertical-align:middle;font-size:.875rem;}
+table th{font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:#64748b;background:#f8fafc;font-weight:700;padding:10px 14px;}
+table td{vertical-align:middle;font-size:.86rem;padding:10px 14px;}
+table tbody tr:hover{background:#f8fafc;}
 /* Badge */
 .badge-available{background:#dcfce7;color:#166534;}
 .badge-full{background:#fee2e2;color:#991b1b;}
@@ -780,7 +920,7 @@ table td{vertical-align:middle;font-size:.875rem;}
 .badge-resolved{background:#dcfce7;color:#166534;}
 .badge-inprogress{background:#fef9c3;color:#854d0e;}
 /* Avatar */
-.avatar{width:36px;height:36px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:.8rem;flex-shrink:0;}
+.avatar{width:36px;height:36px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.78rem;flex-shrink:0;}
 /* Toast */
 #toast-wrap{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px;}
 .toast-msg{background:#1e293b;color:#fff;padding:12px 18px;border-radius:10px;font-size:.875rem;min-width:260px;display:flex;align-items:center;gap:10px;animation:fadeIn .25s;}
@@ -824,6 +964,8 @@ table td{vertical-align:middle;font-size:.875rem;}
     <a class="nav-link" onclick="showPage('complaints')"><i class="bi bi-chat-square-dots-fill"></i> Complaints <span class="badge bg-danger" id="badge-complaints"></span></a>
     <a class="nav-link" onclick="showPage('notices')"><i class="bi bi-megaphone-fill"></i> Notice Board</a>
     <a class="nav-link" onclick="showPage('visitors')"><i class="bi bi-person-badge-fill"></i> Visitors</a>
+    <div class="nav-section mt-2">Admin</div>
+    <a class="nav-link" onclick="showPage('verifications')"><i class="bi bi-shield-check-fill"></i> Student Verifications</a>
   </div>
 </nav>
 
@@ -844,81 +986,129 @@ table td{vertical-align:middle;font-size:.875rem;}
 
   <!-- ═══════════════ DASHBOARD ═══════════════ -->
   <div class="page active" id="page-dashboard">
+
+    <!-- Quick Actions -->
+    <div class="quick-actions">
+      <button class="qa-btn" style="background:#ede9fe;color:#4f46e5" onclick="showPage('students')"><i class="bi bi-person-plus-fill"></i>Add Student</button>
+      <button class="qa-btn" style="background:#dcfce7;color:#16a34a" onclick="showPage('allocations')"><i class="bi bi-key-fill"></i>Allocate Room</button>
+      <button class="qa-btn" style="background:#fff7ed;color:#ea580c" onclick="showPage('fees')"><i class="bi bi-receipt"></i>Record Fee</button>
+      <button class="qa-btn" style="background:#fef9c3;color:#854d0e" onclick="showPage('notices')"><i class="bi bi-megaphone-fill"></i>Post Notice</button>
+      <button class="qa-btn" style="background:#fee2e2;color:#991b1b" onclick="showPage('complaints')"><i class="bi bi-chat-square-dots-fill"></i>View Complaints</button>
+    </div>
+
+    <!-- KPI Row -->
     <div class="row g-3 mb-4">
-      <div class="col-6 col-xl-3">
+      <div class="col-6 col-sm-4 col-xl-2">
         <div class="stat-card">
-          <div class="stat-icon" style="background:#ede9fe"><i class="bi bi-building text-indigo-600" style="color:#7c3aed"></i></div>
+          <div class="stat-icon" style="background:#ede9fe"><i class="bi bi-building" style="color:#7c3aed"></i></div>
           <div><h3 id="s-rooms">0</h3><p>Total Rooms</p></div>
         </div>
       </div>
-      <div class="col-6 col-xl-3">
+      <div class="col-6 col-sm-4 col-xl-2">
         <div class="stat-card">
           <div class="stat-icon" style="background:#dcfce7"><i class="bi bi-people-fill" style="color:#16a34a"></i></div>
-          <div><h3 id="s-students">0</h3><p>Active Students</p></div>
+          <div><h3 id="s-students">0</h3><p>Students</p></div>
         </div>
       </div>
-      <div class="col-6 col-xl-3">
+      <div class="col-6 col-sm-4 col-xl-2">
         <div class="stat-card">
-          <div class="stat-icon" style="background:#fff7ed"><i class="bi bi-cash-coin" style="color:#ea580c"></i></div>
+          <div class="stat-icon" style="background:#dbeafe"><i class="bi bi-door-open-fill" style="color:#1d4ed8"></i></div>
+          <div><h3 id="s-avail">0</h3><p>Available Rooms</p></div>
+        </div>
+      </div>
+      <div class="col-6 col-sm-4 col-xl-2">
+        <div class="stat-card">
+          <div class="stat-icon" style="background:#dcfce7"><i class="bi bi-cash-stack" style="color:#15803d"></i></div>
+          <div><h3 id="s-collected">₹0</h3><p>Fees Collected</p></div>
+        </div>
+      </div>
+      <div class="col-6 col-sm-4 col-xl-2">
+        <div class="stat-card">
+          <div class="stat-icon" style="background:#fff7ed"><i class="bi bi-exclamation-circle-fill" style="color:#ea580c"></i></div>
           <div><h3 id="s-pending">₹0</h3><p>Pending Fees</p></div>
         </div>
       </div>
-      <div class="col-6 col-xl-3">
+      <div class="col-6 col-sm-4 col-xl-2">
         <div class="stat-card">
-          <div class="stat-icon" style="background:#fee2e2"><i class="bi bi-chat-square-dots" style="color:#dc2626"></i></div>
+          <div class="stat-icon" style="background:#fee2e2"><i class="bi bi-chat-square-dots-fill" style="color:#dc2626"></i></div>
           <div><h3 id="s-complaints">0</h3><p>Open Complaints</p></div>
         </div>
       </div>
     </div>
 
+    <!-- Middle Row: Occupancy + Fee Summary + Recent Students -->
     <div class="row g-3 mb-4">
+
+      <!-- Block Occupancy -->
       <div class="col-md-4">
-        <div class="card"><div class="card-header"><i class="bi bi-pie-chart-fill me-2 text-primary"></i>Occupancy</div>
-          <div class="card-body d-flex align-items-center justify-content-center" style="height:220px">
-            <canvas id="chartOccupancy"></canvas>
+        <div class="info-panel h-100">
+          <div class="panel-header">
+            <h6><i class="bi bi-bar-chart-steps me-2 text-primary"></i>Block Occupancy</h6>
+            <span class="text-muted" style="font-size:.75rem" id="occ-summary"></span>
+          </div>
+          <div class="occ-bar-wrap" id="occ-bars">
+            <div class="text-center text-muted py-3" style="font-size:.82rem">Loading...</div>
           </div>
         </div>
       </div>
-      <div class="col-md-4">
-        <div class="card"><div class="card-header"><i class="bi bi-bar-chart-fill me-2 text-success"></i>Room Types</div>
-          <div class="card-body" style="height:220px">
-            <canvas id="chartRoomTypes"></canvas>
+
+      <!-- Fee Summary -->
+      <div class="col-md-3">
+        <div class="info-panel h-100">
+          <div class="panel-header"><h6><i class="bi bi-wallet2 me-2 text-success"></i>Fee Summary</h6></div>
+          <div class="fee-stat">
+            <span class="fee-stat-label">Total Billed</span>
+            <span class="fee-stat-val text-primary" id="fs-total">₹0</span>
+          </div>
+          <div class="fee-stat">
+            <span class="fee-stat-label">Collected</span>
+            <span class="fee-stat-val text-success" id="fs-paid">₹0</span>
+          </div>
+          <div class="fee-stat">
+            <span class="fee-stat-label">Pending</span>
+            <span class="fee-stat-val text-danger" id="fs-pending">₹0</span>
+          </div>
+          <div class="fee-stat">
+            <span class="fee-stat-label">Collection Rate</span>
+            <span class="fee-stat-val text-info" id="fs-rate">0%</span>
+          </div>
+          <div class="px-4 pb-3 pt-1">
+            <div class="occ-track">
+              <div class="occ-fill" id="fs-bar" style="background:#22c55e;width:0%"></div>
+            </div>
           </div>
         </div>
       </div>
-      <div class="col-md-4">
-        <div class="card"><div class="card-header"><i class="bi bi-graph-up me-2 text-warning"></i>Fee Collection</div>
-          <div class="card-body" style="height:220px">
-            <canvas id="chartFees"></canvas>
+
+      <!-- Recent Admissions -->
+      <div class="col-md-5">
+        <div class="info-panel h-100">
+          <div class="panel-header">
+            <h6><i class="bi bi-person-plus-fill me-2 text-primary"></i>Recent Admissions</h6>
+            <button class="btn btn-sm btn-outline-primary" style="font-size:.75rem;padding:3px 10px" onclick="showPage('students')">View All</button>
           </div>
+          <table class="table table-hover mb-0">
+            <thead><tr><th>Student</th><th>Course</th><th>Yr</th></tr></thead>
+            <tbody id="dash-students"></tbody>
+          </table>
         </div>
       </div>
     </div>
 
-    <div class="row g-3">
-      <div class="col-md-7">
-        <div class="card"><div class="card-header d-flex justify-content-between"><span><i class="bi bi-door-open-fill me-2 text-success"></i>Available Rooms</span>
-          <button class="btn btn-sm btn-primary" onclick="showPage('rooms')">View All</button></div>
-          <div class="card-body p-0">
-            <table class="table table-hover mb-0">
-              <thead><tr><th>Room</th><th>Block</th><th>Type</th><th>Available</th><th>Rent</th><th></th></tr></thead>
-              <tbody id="dash-rooms"></tbody>
-            </table>
-          </div>
-        </div>
+    <!-- Bottom Row: Available Rooms -->
+    <div class="info-panel">
+      <div class="panel-header">
+        <h6><i class="bi bi-door-open-fill me-2 text-success"></i>Available Rooms</h6>
+        <button class="btn btn-sm btn-outline-success" style="font-size:.75rem;padding:3px 10px" onclick="showPage('rooms')">View All Rooms</button>
       </div>
-      <div class="col-md-5">
-        <div class="card"><div class="card-header d-flex justify-content-between"><span><i class="bi bi-person-plus-fill me-2 text-primary"></i>Recent Admissions</span>
-          <button class="btn btn-sm btn-primary" onclick="showPage('students')">View All</button></div>
-          <div class="card-body p-0">
-            <table class="table table-hover mb-0">
-              <thead><tr><th>Student</th><th>Course</th><th>Year</th></tr></thead>
-              <tbody id="dash-students"></tbody>
-            </table>
-          </div>
-        </div>
+      <div class="table-responsive">
+        <table class="table table-hover mb-0">
+          <thead><tr><th>Room No</th><th>Block</th><th>Floor</th><th>Type</th><th>Beds Free</th><th>Monthly Rent</th><th></th></tr></thead>
+          <tbody id="dash-rooms"></tbody>
+        </table>
       </div>
     </div>
+
   </div>
 
   <!-- ═══════════════ ROOMS ═══════════════ -->
@@ -1174,6 +1364,58 @@ table td{vertical-align:middle;font-size:.875rem;}
     </div>
   </div>
 
+  <!-- ═══════════════ STUDENT VERIFICATIONS ═══════════════ -->
+  <div class="page" id="page-verifications">
+    <div class="row g-3">
+      <div class="col-md-4">
+        <div class="card">
+          <div class="card-header"><i class="bi bi-shield-plus-fill me-2 text-success"></i>Add Verification Code</div>
+          <div class="card-body">
+            <div class="mb-2"><label class="form-label">Verification Code / Admission No *</label>
+              <input class="form-control" id="vf-code" placeholder="e.g. ADM2026005 or S005"></div>
+            <div class="mb-2"><label class="form-label">Student Type</label>
+              <select class="form-select" id="vf-type">
+                <option value="fresher">Fresher (Admission No)</option>
+                <option value="existing">Existing Student (Roll No)</option>
+              </select></div>
+            <div class="mb-2"><label class="form-label">Full Name *</label>
+              <input class="form-control" id="vf-name" placeholder="Student's full name"></div>
+            <div class="mb-2"><label class="form-label">Email</label>
+              <input type="email" class="form-control" id="vf-email"></div>
+            <div class="mb-2"><label class="form-label">Course</label>
+              <input class="form-control" id="vf-course" placeholder="B.Tech CSE"></div>
+            <div class="row g-2 mb-3">
+              <div class="col"><label class="form-label">Year</label>
+                <select class="form-select" id="vf-year"><option value="1">1st</option><option value="2">2nd</option><option value="3">3rd</option><option value="4">4th</option></select></div>
+              <div class="col"><label class="form-label">Gender</label>
+                <select class="form-select" id="vf-gender"><option>Male</option><option>Female</option><option>Other</option></select></div>
+            </div>
+            <button class="btn btn-success w-100" onclick="addVerification()"><i class="bi bi-plus-lg me-1"></i>Add Verification Record</button>
+            <hr class="my-3">
+            <div class="alert alert-info p-2" style="font-size:.8rem">
+              <i class="bi bi-info-circle me-1"></i><strong>How it works:</strong> Add a record here with the student's admission/counselling number. The student uses that code at <code>/register</code> to self-register.
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-8">
+        <div class="d-flex gap-2 mb-2">
+          <span class="fw-semibold">Pre-Approved Student List</span>
+          <button class="btn btn-sm btn-outline-primary ms-auto" onclick="loadVerifications()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+          <a href="/register" target="_blank" class="btn btn-sm btn-outline-success"><i class="bi bi-box-arrow-up-right me-1"></i>Open Register Page</a>
+        </div>
+        <div class="card"><div class="card-body p-0">
+          <div class="table-responsive">
+            <table class="table table-hover mb-0">
+              <thead><tr><th>Code</th><th>Type</th><th>Name</th><th>Course</th><th>Email</th><th>Status</th><th>Registered</th><th></th></tr></thead>
+              <tbody id="verif-tbody"></tbody>
+            </table>
+          </div>
+        </div></div>
+      </div>
+    </div>
+  </div>
+
   </div><!-- /content -->
 </div><!-- /main -->
 
@@ -1330,7 +1572,7 @@ function showPage(name){
     notices:'Notice Board',visitors:'Visitor Log'};
   document.getElementById('topbar-title').textContent=titles[name]||name;
   const loaders={rooms:loadRooms,students:loadStudents,allocations:()=>{loadAllocations();loadAllocDropdowns();},
-    fees:loadFees,complaints:loadComplaints,notices:loadNotices,visitors:loadVisitors};
+    fees:loadFees,complaints:loadComplaints,notices:loadNotices,visitors:loadVisitors,verifications:loadVerifications};
   loaders[name]?.();
 }
 function toggleSidebar(){
@@ -1375,62 +1617,80 @@ function priorityBadge(p){
 async function loadDashboard(){
   try{
     const d=await api('/api/stats');
+    // KPI cards
     document.getElementById('s-rooms').textContent=d.total_rooms;
     document.getElementById('s-students').textContent=d.total_students;
+    document.getElementById('s-avail').textContent=d.available_rooms;
+    document.getElementById('s-collected').textContent='₹'+d.collected_fees.toLocaleString('en-IN');
     document.getElementById('s-pending').textContent='₹'+d.pending_fees.toLocaleString('en-IN');
     document.getElementById('s-complaints').textContent=d.open_complaints;
     if(d.open_complaints>0) document.getElementById('badge-complaints').textContent=d.open_complaints;
 
+    // Fee summary widget
+    const total=d.collected_fees+d.pending_fees;
+    const rate=total>0?Math.round(d.collected_fees/total*100):0;
+    document.getElementById('fs-total').textContent='₹'+total.toLocaleString('en-IN');
+    document.getElementById('fs-paid').textContent='₹'+d.collected_fees.toLocaleString('en-IN');
+    document.getElementById('fs-pending').textContent='₹'+d.pending_fees.toLocaleString('en-IN');
+    document.getElementById('fs-rate').textContent=rate+'%';
+    document.getElementById('fs-bar').style.width=rate+'%';
+
+    // Block occupancy bars
+    buildOccupancyBars(d);
+
     // Available rooms table
-    document.getElementById('dash-rooms').innerHTML=d.available_room_list.map(r=>`
-      <tr><td><strong>${r.room_no}</strong></td><td>${r.block}</td><td>${r.type}</td>
-      <td>${r.capacity-r.occupied} / ${r.capacity}</td><td>₹${r.rent.toLocaleString('en-IN')}</td>
-      <td><button class="btn btn-sm btn-outline-primary" onclick="showPage('allocations')">Allocate</button></td></tr>
-    `).join('');
+    document.getElementById('dash-rooms').innerHTML=d.available_room_list.length
+      ?d.available_room_list.map(r=>`
+        <tr>
+          <td><strong class="text-primary">${r.room_no}</strong></td>
+          <td><span class="badge" style="background:#ede9fe;color:#4f46e5">Block ${r.block}</span></td>
+          <td>${r.floor}</td>
+          <td>${r.type}</td>
+          <td><span class="fw-semibold text-success">${r.capacity-r.occupied}</span> <small class="text-muted">of ${r.capacity}</small></td>
+          <td class="fw-semibold">₹${r.rent.toLocaleString('en-IN')}<small class="text-muted fw-normal">/mo</small></td>
+          <td><button class="btn btn-sm btn-primary" onclick="showPage('allocations')">Allocate</button></td>
+        </tr>
+      `).join('')
+      :'<tr><td colspan="7" class="text-center text-muted py-4"><i class="bi bi-check-circle text-success fs-4 d-block mb-1"></i>All rooms are fully occupied</td></tr>';
 
     // Recent students
     document.getElementById('dash-students').innerHTML=d.recent_students.map(s=>`
-      <tr><td><div class="d-flex align-items-center gap-2"><div class="avatar" style="width:28px;height:28px;font-size:.7rem">${s.name.charAt(0)}</div>${s.name}</div></td>
-      <td>${s.course||'-'}</td><td>${s.year||'-'}</td></tr>
+      <tr>
+        <td><div class="d-flex align-items-center gap-2">
+          <div class="avatar" style="width:30px;height:30px;font-size:.73rem">${s.name.charAt(0)}</div>
+          <div><div style="font-size:.84rem;font-weight:600">${s.name}</div><div style="font-size:.73rem;color:#64748b">${s.student_id}</div></div>
+        </div></td>
+        <td style="font-size:.8rem">${s.course||'—'}</td>
+        <td><span class="badge" style="background:#f1f5f9;color:#374151">Yr ${s.year||'—'}</span></td>
+      </tr>
     `).join('');
 
-    // Charts
-    buildOccupancyChart(d);
-    buildRoomTypeChart(d);
-    buildFeeChart(d);
   }catch(e){ toast('Failed to load dashboard: '+e.message,'error'); }
 }
 
-function buildOccupancyChart(d){
-  const ctx=document.getElementById('chartOccupancy');
-  if(charts.occ) charts.occ.destroy();
-  charts.occ=new Chart(ctx,{type:'doughnut',data:{
-    labels:['Occupied','Vacant'],
-    datasets:[{data:[d.total_occupied,d.total_capacity-d.total_occupied],
-      backgroundColor:['#4f46e5','#e0e7ff'],borderWidth:0}]
-  },options:{plugins:{legend:{position:'bottom'}},cutout:'70%',maintainAspectRatio:false}});
-}
-function buildRoomTypeChart(d){
-  const ctx=document.getElementById('chartRoomTypes');
-  if(charts.type) charts.type.destroy();
-  charts.type=new Chart(ctx,{type:'bar',data:{
-    labels:d.room_type_stats.map(r=>r.type),
-    datasets:[
-      {label:'Occupied',data:d.room_type_stats.map(r=>r.occupied),backgroundColor:'#4f46e5'},
-      {label:'Available',data:d.room_type_stats.map(r=>r.capacity-r.occupied),backgroundColor:'#e0e7ff'}
-    ]
-  },options:{plugins:{legend:{position:'bottom'}},maintainAspectRatio:false,scales:{x:{stacked:true},y:{stacked:true}}}});
-}
-function buildFeeChart(d){
-  const ctx=document.getElementById('chartFees');
-  if(charts.fee) charts.fee.destroy();
-  charts.fee=new Chart(ctx,{type:'bar',data:{
-    labels:d.fee_months.map(f=>f.month),
-    datasets:[
-      {label:'Collected',data:d.fee_months.map(f=>f.paid),backgroundColor:'#22c55e'},
-      {label:'Pending',data:d.fee_months.map(f=>f.pending),backgroundColor:'#f97316'}
-    ]
-  },options:{plugins:{legend:{position:'bottom'}},maintainAspectRatio:false}});
+function buildOccupancyBars(d){
+  // Compute per-block stats from room_type_stats (fallback: use total)
+  // We'll fetch rooms data to get per-block info
+  fetch('/api/rooms').then(r=>r.json()).then(rooms=>{
+    const blocks={};
+    rooms.forEach(r=>{
+      if(!blocks[r.block]) blocks[r.block]={cap:0,occ:0};
+      blocks[r.block].cap+=r.capacity;
+      blocks[r.block].occ+=r.occupied;
+    });
+    const colors={'A':'#4f46e5','B':'#0ea5e9','C':'#10b981','D':'#f59e0b','E':'#ef4444'};
+    const totalCap=Object.values(blocks).reduce((s,b)=>s+b.cap,0);
+    const totalOcc=Object.values(blocks).reduce((s,b)=>s+b.occ,0);
+    document.getElementById('occ-summary').textContent=`${totalOcc}/${totalCap} occupied`;
+    document.getElementById('occ-bars').innerHTML=Object.entries(blocks).map(([blk,b])=>{
+      const pct=b.cap>0?Math.round(b.occ/b.cap*100):0;
+      const col=colors[blk]||'#6366f1';
+      return `<div class="occ-item">
+        <div class="occ-label"><span>Block ${blk}</span><span style="color:${col}">${b.occ}/${b.cap} &nbsp;(${pct}%)</span></div>
+        <div class="occ-track"><div class="occ-fill" style="width:${pct}%;background:${col}"></div></div>
+      </div>`;
+    }).join('');
+  }).catch(()=>{});
 }
 
 // ── ROOMS ─────────────────────────────────────────────────────────────────────
@@ -1894,6 +2154,48 @@ async function doLogout(){
   await fetch('/api/logout',{method:'POST'});
   window.location.href='/login';
 }
+
+// ── VERIFICATIONS ──────────────────────────────────────────────────────────────
+async function loadVerifications(){
+  try{
+    const rows=await api('/api/verifications');
+    document.getElementById('verif-tbody').innerHTML=rows.length?rows.map(r=>`
+      <tr>
+        <td><code>${r.verify_code}</code></td>
+        <td><span class="badge ${r.student_type==='fresher'?'bg-primary':'bg-success'} bg-opacity-15 text-${r.student_type==='fresher'?'primary':'success'}">${r.student_type==='fresher'?'Fresher':'Existing'}</span></td>
+        <td><strong>${r.name}</strong></td>
+        <td>${r.course||'—'}</td>
+        <td><small>${r.email||'—'}</small></td>
+        <td>${r.is_registered?'<span class="badge badge-paid">Registered</span>':'<span class="badge badge-pending">Pending</span>'}</td>
+        <td><small>${r.registered_at?r.registered_at.slice(0,10):'—'}</small></td>
+        <td>${!r.is_registered?`<button class="btn btn-sm btn-outline-danger" onclick="delVerif(${r.id})"><i class="bi bi-trash"></i></button>`:''}</td>
+      </tr>`).join(''):'<tr><td colspan="8" class="text-center text-muted py-4">No verification records</td></tr>';
+  }catch(e){ toast('Failed to load verifications','error'); }
+}
+
+async function addVerification(){
+  const code=document.getElementById('vf-code').value.trim();
+  const name=document.getElementById('vf-name').value.trim();
+  if(!code||!name){toast('Code and name are required','error');return;}
+  try{
+    await api('/api/verifications','POST',{
+      verify_code:code, student_type:document.getElementById('vf-type').value,
+      name, email:document.getElementById('vf-email').value,
+      course:document.getElementById('vf-course').value,
+      year:+document.getElementById('vf-year').value,
+      gender:document.getElementById('vf-gender').value
+    });
+    toast('Verification record added! Student can now register.');
+    ['vf-code','vf-name','vf-email','vf-course'].forEach(i=>document.getElementById(i).value='');
+    loadVerifications();
+  }catch(e){ toast(e.message,'error'); }
+}
+
+async function delVerif(id){
+  if(!confirm('Delete this verification code?')) return;
+  try{ await api(`/api/verifications/${id}`,'DELETE'); toast('Deleted','info'); loadVerifications(); }
+  catch(e){ toast(e.message,'error'); }
+}
 </script>
 </body>
 </html>"""
@@ -1904,79 +2206,161 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hostel MS — Login</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<title>HostelMS &mdash; Sign In</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
-body{min-height:100vh;background:linear-gradient(135deg,#1e1b4b 0%,#312e81 40%,#4f46e5 100%);display:flex;align-items:center;justify-content:center;font-family:'Segoe UI',sans-serif;}
-.login-card{background:#fff;border-radius:20px;padding:40px 36px;width:100%;max-width:420px;box-shadow:0 25px 60px rgba(0,0,0,.35);}
-.login-card .brand{text-align:center;margin-bottom:28px;}
-.login-card .brand .icon{width:64px;height:64px;background:linear-gradient(135deg,#4f46e5,#7c3aed);border-radius:16px;display:flex;align-items:center;justify-content:center;margin:0 auto 12px;}
-.login-card .brand h4{font-weight:700;color:#1e293b;margin:0;}
-.login-card .brand p{color:#64748b;font-size:.875rem;margin:4px 0 0;}
-.form-control{border-radius:10px;border:1.5px solid #e2e8f0;padding:11px 14px;font-size:.9rem;}
-.form-control:focus{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,.12);outline:none;}
-.form-label{font-size:.82rem;font-weight:600;color:#374151;margin-bottom:5px;}
-.btn-login{background:linear-gradient(135deg,#4f46e5,#7c3aed);border:none;border-radius:10px;padding:12px;font-weight:600;font-size:.95rem;letter-spacing:.02em;transition:.2s;}
-.btn-login:hover{opacity:.92;transform:translateY(-1px);}
-.demo-box{background:#f8fafc;border-radius:12px;padding:14px 16px;margin-top:20px;border:1px solid #e2e8f0;}
-.demo-box p{font-size:.78rem;color:#64748b;margin:0 0 8px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;}
-.demo-row{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid #f1f5f9;cursor:pointer;}
-.demo-row:last-child{border-bottom:none;}
-.demo-row:hover{opacity:.8;}
-.role-badge{font-size:.7rem;padding:2px 8px;border-radius:20px;font-weight:600;}
-.role-admin{background:#ede9fe;color:#5b21b6;}
-.role-student{background:#dcfce7;color:#166534;}
-.error-msg{background:#fee2e2;color:#991b1b;border-radius:8px;padding:10px 14px;font-size:.875rem;display:none;margin-bottom:12px;}
-.input-icon{position:relative;}
-.input-icon i{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:#94a3b8;}
-.input-icon input{padding-left:36px;}
+body{min-height:100vh;display:flex;font-family:'Segoe UI',system-ui,sans-serif;background:#f8fafc;}
+/* Left panel */
+.lp{width:42%;flex-shrink:0;background:linear-gradient(160deg,#1e1b4b 0%,#312e81 52%,#4338ca 100%);display:flex;flex-direction:column;justify-content:center;padding:48px 44px;position:relative;overflow:hidden;}
+.lp::before{content:'';position:absolute;inset:0;opacity:.06;background-image:radial-gradient(circle,#fff 1px,transparent 1px);background-size:28px 28px;}
+.logo-box{width:58px;height:58px;background:rgba(255,255,255,.15);border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:1.7rem;margin-bottom:22px;}
+.app-name{color:#fff;font-size:2.1rem;font-weight:800;letter-spacing:-.03em;line-height:1.1;}
+.app-sub{color:#a5b4fc;font-size:.88rem;margin:6px 0 38px;}
+.feat{display:flex;flex-direction:column;gap:14px;}
+.fi{display:flex;align-items:flex-start;gap:13px;}
+.fic{width:36px;height:36px;border-radius:10px;background:rgba(255,255,255,.1);display:flex;align-items:center;justify-content:center;font-size:1rem;color:#c7d2fe;flex-shrink:0;margin-top:1px;}
+.fit strong{color:#fff;display:block;font-size:.85rem;}
+.fit span{color:#a5b4fc;font-size:.79rem;line-height:1.4;}
+.kpis{display:flex;gap:12px;margin-top:38px;}
+.kpi{flex:1;background:rgba(255,255,255,.08);border-radius:12px;padding:14px 10px;text-align:center;}
+.kpi-n{color:#fff;font-size:1.55rem;font-weight:800;line-height:1;}
+.kpi-l{color:#a5b4fc;font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;margin-top:3px;}
+/* Right panel */
+.rp{flex:1;display:flex;align-items:center;justify-content:center;padding:40px 32px;}
+.fw{width:100%;max-width:400px;}
+.fw h2{font-size:1.7rem;font-weight:800;color:#0f172a;letter-spacing:-.025em;margin-bottom:3px;}
+.fw .sub{color:#64748b;font-size:.88rem;margin-bottom:30px;}
+.lbl{font-size:.76rem;font-weight:700;color:#374151;display:block;margin-bottom:6px;letter-spacing:.03em;text-transform:uppercase;}
+.finp{position:relative;margin-bottom:16px;}
+.finp i{position:absolute;left:13px;top:50%;transform:translateY(-50%);color:#94a3b8;font-size:.9rem;pointer-events:none;}
+.finp input{width:100%;padding:11px 14px 11px 38px;border:1.5px solid #e2e8f0;border-radius:10px;font-size:.9rem;color:#1e293b;background:#fff;transition:border-color .2s,box-shadow .2s;outline:none;}
+.finp input:focus{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,.12);}
+.finp input::placeholder{color:#cbd5e1;}
+.btn-si{width:100%;padding:12px;background:linear-gradient(135deg,#4f46e5,#6d28d9);border:none;border-radius:10px;color:#fff;font-size:.95rem;font-weight:700;cursor:pointer;transition:.2s;display:flex;align-items:center;justify-content:center;gap:8px;margin-top:4px;}
+.btn-si:hover{filter:brightness(1.09);transform:translateY(-1px);box-shadow:0 6px 20px rgba(79,70,229,.3);}
+.btn-si:active{transform:none;box-shadow:none;}
+.err{background:#fef2f2;border:1px solid #fecaca;border-radius:9px;padding:10px 14px;font-size:.82rem;color:#b91c1c;margin-bottom:14px;display:none;align-items:center;gap:8px;}
+.divider{display:flex;align-items:center;gap:10px;margin:22px 0 14px;}
+.divider hr{flex:1;border:none;border-top:1px solid #e2e8f0;}
+.divider span{font-size:.7rem;color:#94a3b8;font-weight:600;white-space:nowrap;letter-spacing:.05em;}
+.cgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+.cc{background:#fff;border:1.5px solid #e2e8f0;border-radius:10px;padding:10px 11px;cursor:pointer;transition:.18s;display:flex;align-items:center;gap:8px;}
+.cc:hover{border-color:#4f46e5;background:#f5f3ff;transform:translateY(-1px);}
+.cb{font-size:.6rem;font-weight:700;padding:2px 7px;border-radius:20px;flex-shrink:0;}
+.ca{background:#ede9fe;color:#5b21b6;}
+.cs{background:#dcfce7;color:#166534;}
+.cu{font-size:.8rem;font-weight:700;color:#1e293b;display:block;}
+.cp{font-size:.7rem;color:#64748b;display:block;}
+.reg{text-align:center;margin-top:18px;font-size:.82rem;color:#64748b;}
+.reg a{color:#4f46e5;font-weight:700;text-decoration:none;}
+.reg a:hover{text-decoration:underline;}
+@media(max-width:760px){body{flex-direction:column;}.lp{width:100%;padding:30px 22px;}.feat{display:grid;grid-template-columns:1fr 1fr;gap:10px;}.kpis{margin-top:18px;}.rp{padding:26px 18px;}}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
-<div class="login-card">
-  <div class="brand">
-    <div class="icon"><i class="bi bi-building-fill text-white fs-3"></i></div>
-    <h4>HostelMS</h4>
-    <p>Hostel Management System</p>
+
+<div class="lp">
+  <div class="logo-box">&#127968;</div>
+  <div class="app-name">HostelMS</div>
+  <div class="app-sub">Hostel Room Allocation &amp; Fee Management System</div>
+  <div class="feat">
+    <div class="fi">
+      <div class="fic"><i class="bi bi-building"></i></div>
+      <div class="fit"><strong>Room Management</strong><span>Multi-block allocation with live capacity tracking</span></div>
+    </div>
+    <div class="fi">
+      <div class="fic"><i class="bi bi-cash-coin"></i></div>
+      <div class="fit"><strong>Fee Collection</strong><span>Monthly billing, payment modes &amp; receipts</span></div>
+    </div>
+    <div class="fi">
+      <div class="fic"><i class="bi bi-shield-check"></i></div>
+      <div class="fit"><strong>Role-Based Access</strong><span>Admin, Warden &amp; Student self-portal</span></div>
+    </div>
+    <div class="fi">
+      <div class="fic"><i class="bi bi-megaphone"></i></div>
+      <div class="fit"><strong>Notices &amp; Complaints</strong><span>Real-time hostel communication board</span></div>
+    </div>
   </div>
-  <div class="error-msg" id="err-msg"><i class="bi bi-exclamation-circle me-2"></i><span id="err-txt"></span></div>
-  <div class="mb-3">
-    <label class="form-label"><i class="bi bi-person me-1"></i>Username</label>
-    <div class="input-icon"><i class="bi bi-person"></i><input type="text" class="form-control" id="username" placeholder="Enter username" autofocus></div>
-  </div>
-  <div class="mb-4">
-    <label class="form-label"><i class="bi bi-lock me-1"></i>Password</label>
-    <div class="input-icon"><i class="bi bi-lock"></i><input type="password" class="form-control" id="password" placeholder="Enter password" onkeydown="if(event.key==='Enter')doLogin()"></div>
-  </div>
-  <button class="btn btn-login btn-primary w-100 text-white" onclick="doLogin()" id="login-btn">
-    <i class="bi bi-box-arrow-in-right me-2"></i>Sign In
-  </button>
-  <div class="demo-box">
-    <p>Quick Login (click to fill)</p>
-    <div class="demo-row" onclick="fill('admin','admin123')"><span class="role-badge role-admin">ADMIN</span><span style="font-size:.83rem">admin / admin123</span><small class="ms-auto text-muted">Full Access</small></div>
-    <div class="demo-row" onclick="fill('warden','warden123')"><span class="role-badge role-admin">ADMIN</span><span style="font-size:.83rem">warden / warden123</span><small class="ms-auto text-muted">Full Access</small></div>
-    <div class="demo-row" onclick="fill('rahul','rahul123')"><span class="role-badge role-student">STUDENT</span><span style="font-size:.83rem">rahul / rahul123</span><small class="ms-auto text-muted">Self Portal</small></div>
-    <div class="demo-row" onclick="fill('priya','priya123')"><span class="role-badge role-student">STUDENT</span><span style="font-size:.83rem">priya / priya123</span><small class="ms-auto text-muted">Self Portal</small></div>
+  <div class="kpis">
+    <div class="kpi"><div class="kpi-n">107</div><div class="kpi-l">Students</div></div>
+    <div class="kpi"><div class="kpi-n">50</div><div class="kpi-l">Rooms</div></div>
+    <div class="kpi"><div class="kpi-n">4</div><div class="kpi-l">Blocks</div></div>
   </div>
 </div>
+
+<div class="rp">
+  <div class="fw">
+    <h2>Welcome back &#128075;</h2>
+    <p class="sub">Sign in to continue to your dashboard</p>
+
+    <div class="err" id="err-box">
+      <i class="bi bi-exclamation-circle-fill"></i>
+      <span id="err-txt"></span>
+    </div>
+
+    <label class="lbl">Username</label>
+    <div class="finp">
+      <i class="bi bi-person"></i>
+      <input type="text" id="username" placeholder="Enter your username" autofocus>
+    </div>
+
+    <label class="lbl">Password</label>
+    <div class="finp">
+      <i class="bi bi-lock"></i>
+      <input type="password" id="password" placeholder="Enter your password" onkeydown="if(event.key==='Enter')doLogin()">
+    </div>
+
+    <button class="btn-si" onclick="doLogin()" id="login-btn">
+      <i class="bi bi-box-arrow-in-right"></i> Sign In
+    </button>
+
+    <div class="divider"><hr><span>QUICK TEST LOGIN</span><hr></div>
+
+    <div class="cgrid">
+      <div class="cc" onclick="fill('admin','admin123')">
+        <span class="cb ca">ADMIN</span>
+        <div><span class="cu">admin</span><span class="cp">admin123 &middot; Full Access</span></div>
+      </div>
+      <div class="cc" onclick="fill('warden','warden123')">
+        <span class="cb ca">ADMIN</span>
+        <div><span class="cu">warden</span><span class="cp">warden123 &middot; Full Access</span></div>
+      </div>
+      <div class="cc" onclick="fill('rahul','rahul123')">
+        <span class="cb cs">STUDENT</span>
+        <div><span class="cu">rahul</span><span class="cp">rahul123 &middot; My Portal</span></div>
+      </div>
+      <div class="cc" onclick="fill('aryan','aryan123')">
+        <span class="cb cs">STUDENT</span>
+        <div><span class="cu">aryan</span><span class="cp">aryan123 &middot; My Portal</span></div>
+      </div>
+    </div>
+
+    <div class="reg">
+      New student? <a href="/register"><i class="bi bi-person-plus"></i> Register with admission code</a>
+    </div>
+  </div>
+</div>
+
 <script>
 function fill(u,p){document.getElementById('username').value=u;document.getElementById('password').value=p;}
 async function doLogin(){
   const u=document.getElementById('username').value.trim();
   const p=document.getElementById('password').value;
-  if(!u||!p){showErr('Please enter username and password');return;}
+  if(!u||!p){showErr('Please enter both username and password');return;}
   const btn=document.getElementById('login-btn');
-  btn.disabled=true;btn.innerHTML='<span class="spinner-border spinner-border-sm me-2"></span>Signing in...';
+  btn.disabled=true;
+  btn.innerHTML='<span style="width:15px;height:15px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;display:inline-block;animation:spin .7s linear infinite"></span>&nbsp;Signing in...';
   try{
     const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
     const d=await r.json();
-    if(!r.ok){showErr(d.error||'Login failed');btn.disabled=false;btn.innerHTML='<i class="bi bi-box-arrow-in-right me-2"></i>Sign In';return;}
+    if(!r.ok){showErr(d.error||'Invalid credentials');resetBtn();return;}
     window.location.href='/';
-  }catch(e){showErr('Server error. Try again.');btn.disabled=false;btn.innerHTML='<i class="bi bi-box-arrow-in-right me-2"></i>Sign In';}
+  }catch(e){showErr('Server error. Please try again.');resetBtn();}
 }
-function showErr(m){const e=document.getElementById('err-msg');document.getElementById('err-txt').textContent=m;e.style.display='block';setTimeout(()=>e.style.display='none',4000);}
+function resetBtn(){const b=document.getElementById('login-btn');b.disabled=false;b.innerHTML='<i class="bi bi-box-arrow-in-right"></i> Sign In';}
+function showErr(m){const b=document.getElementById('err-box');document.getElementById('err-txt').textContent=m;b.style.display='flex';setTimeout(()=>b.style.display='none',4500);}
 </script>
 </body></html>"""
 
@@ -2307,6 +2691,210 @@ async function doLogout(){
 }
 
 document.addEventListener('DOMContentLoaded', init);
+</script>
+</body></html>"""
+
+# ─── REGISTER PAGE HTML ───────────────────────────────────────────────────────
+REGISTER_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Student Registration — HostelMS</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{min-height:100vh;background:linear-gradient(135deg,#1e1b4b 0%,#312e81 45%,#4f46e5 100%);display:flex;align-items:flex-start;justify-content:center;font-family:'Segoe UI',sans-serif;padding:30px 16px;}
+.reg-card{background:#fff;border-radius:20px;padding:34px 32px 28px;width:100%;max-width:560px;box-shadow:0 24px 60px rgba(0,0,0,.35);}
+.brand{text-align:center;margin-bottom:20px;}
+.brand .icon{width:54px;height:54px;background:linear-gradient(135deg,#4f46e5,#7c3aed);border-radius:14px;display:flex;align-items:center;justify-content:center;margin:0 auto 10px;}
+.brand h4{font-weight:700;color:#1e293b;font-size:1.15rem;margin:0;}
+.brand p{color:#64748b;font-size:.8rem;margin:2px 0 0;}
+.step-bar{display:flex;align-items:center;margin-bottom:22px;}
+.step-item{flex:1;text-align:center;}
+.sc{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:.75rem;font-weight:700;margin:0 auto 3px;transition:.3s;}
+.sc.act{background:#4f46e5;color:#fff;box-shadow:0 0 0 3px rgba(79,70,229,.2);}
+.sc.done{background:#22c55e;color:#fff;}
+.sc.pend{background:#e2e8f0;color:#94a3b8;}
+.sl{flex:0 0 40px;height:2px;background:#e2e8f0;margin-bottom:16px;transition:.4s;}
+.sl.done{background:#22c55e;}
+.step-label{font-size:.67rem;color:#64748b;font-weight:600;text-transform:uppercase;}
+.err{background:#fee2e2;color:#991b1b;border-radius:8px;padding:10px 14px;font-size:.83rem;margin-bottom:14px;display:none;}
+.form-label{font-size:.8rem;font-weight:600;color:#374151;margin-bottom:4px;}
+.form-control,.form-select{border-radius:9px;border:1.5px solid #e2e8f0;font-size:.875rem;}
+.form-control:focus,.form-select:focus{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,.1);outline:none;}
+.btn-main{background:linear-gradient(135deg,#4f46e5,#7c3aed);border:none;border-radius:10px;padding:11px 16px;font-weight:600;font-size:.9rem;color:#fff;transition:.2s;}
+.btn-main:hover{opacity:.9;transform:translateY(-1px);color:#fff;}
+.btn-back{background:#f1f5f9;border:none;border-radius:10px;padding:11px 16px;font-weight:600;color:#475569;}
+.btn-back:hover{background:#e2e8f0;}
+.type-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:18px;}
+.type-btn{padding:14px 10px;border-radius:12px;border:2px solid #e2e8f0;background:#fff;cursor:pointer;text-align:center;transition:.2s;}
+.type-btn:hover{border-color:#a5b4fc;}
+.type-btn.sel{border-color:#4f46e5;background:#ede9fe;}
+.type-btn i{display:block;font-size:1.6rem;color:#94a3b8;margin-bottom:5px;}
+.type-btn.sel i{color:#4f46e5;}
+.type-btn strong{display:block;font-size:.83rem;color:#1e293b;}
+.type-btn small{font-size:.73rem;color:#64748b;}
+.ok-bar{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:11px 14px;margin-bottom:14px;}
+.ok-bar b{color:#166534;font-size:.83rem;}
+.ok-bar p{color:#15803d;font-size:.78rem;margin:2px 0 0;}
+.success-box{text-align:center;padding:16px 0;}
+.check-icon{width:70px;height:70px;background:#dcfce7;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.9rem;color:#16a34a;margin:0 auto 14px;}
+</style></head>
+<body><div class="reg-card">
+  <div class="brand">
+    <div class="icon"><i class="bi bi-building-fill text-white" style="font-size:1.4rem"></i></div>
+    <h4>HostelMS — Student Registration</h4>
+    <p>Self-register using your admission or roll number</p>
+  </div>
+
+  <div class="step-bar" id="step-bar">
+    <div class="step-item"><div class="sc act" id="sc1">1</div><div class="step-label">Verify</div></div>
+    <div class="sl" id="sl1"></div>
+    <div class="step-item"><div class="sc pend" id="sc2">2</div><div class="step-label">Profile</div></div>
+    <div class="sl" id="sl2"></div>
+    <div class="step-item"><div class="sc pend" id="sc3">3</div><div class="step-label">Account</div></div>
+  </div>
+
+  <div class="err" id="err-msg"><i class="bi bi-exclamation-triangle me-1"></i><span id="err-txt"></span></div>
+
+  <!-- STEP 1: Verify -->
+  <div id="s1">
+    <p style="font-size:.83rem;color:#64748b;margin-bottom:14px">Choose your student type and enter the verification code provided by the hostel administration.</p>
+    <div class="type-grid">
+      <div class="type-btn sel" id="btn-f" onclick="selType('fresher')">
+        <i class="bi bi-person-plus-fill"></i>
+        <strong>Fresher</strong><small>Admission / Counselling Receipt No.</small>
+      </div>
+      <div class="type-btn" id="btn-e" onclick="selType('existing')">
+        <i class="bi bi-person-badge-fill"></i>
+        <strong>Existing Student</strong><small>Student Roll No.</small>
+      </div>
+    </div>
+    <div class="mb-3">
+      <label class="form-label" id="code-lbl"><i class="bi bi-shield-lock me-1"></i>Admission / Counselling Receipt No. *</label>
+      <input class="form-control" id="vcode" placeholder="e.g. ADM2026001" onkeydown="if(event.key==='Enter')verifyCode()">
+    </div>
+    <button class="btn btn-main w-100" onclick="verifyCode()" id="vbtn"><i class="bi bi-shield-check me-2"></i>Verify Identity</button>
+    <p class="text-center mt-3" style="font-size:.82rem;color:#94a3b8">Already registered? <a href="/login" style="color:#4f46e5;font-weight:600">Sign In</a></p>
+  </div>
+
+  <!-- STEP 2: Profile -->
+  <div id="s2" style="display:none">
+    <div class="ok-bar"><b><i class="bi bi-check-circle-fill me-1"></i>Identity Verified!</b><p id="ok-msg">Complete your profile below.</p></div>
+    <div class="row g-2">
+      <div class="col-md-6"><label class="form-label">Full Name *</label><input class="form-control" id="rn"></div>
+      <div class="col-md-6"><label class="form-label">Email *</label><input type="email" class="form-control" id="re"></div>
+      <div class="col-md-6"><label class="form-label">Phone</label><input class="form-control" id="rp" placeholder="10-digit number"></div>
+      <div class="col-md-6"><label class="form-label">Gender</label>
+        <select class="form-select" id="rg"><option>Male</option><option>Female</option><option>Other</option></select></div>
+      <div class="col-md-6"><label class="form-label">Date of Birth</label><input type="date" class="form-control" id="rd"></div>
+      <div class="col-md-6"><label class="form-label">Course</label><input class="form-control" id="rc" placeholder="B.Tech CSE"></div>
+      <div class="col-md-6"><label class="form-label">Year</label>
+        <select class="form-select" id="ry"><option value="1">1st Year</option><option value="2">2nd Year</option><option value="3">3rd Year</option><option value="4">4th Year</option></select></div>
+      <div class="col-md-6"><label class="form-label">Guardian Name</label><input class="form-control" id="rgn"></div>
+      <div class="col-md-6"><label class="form-label">Guardian Phone</label><input class="form-control" id="rgp"></div>
+      <div class="col-12"><label class="form-label">Permanent Address</label><textarea class="form-control" id="ra" rows="2"></textarea></div>
+    </div>
+    <div class="d-flex gap-2 mt-3">
+      <button class="btn btn-back" onclick="goStep(1)"><i class="bi bi-arrow-left"></i></button>
+      <button class="btn btn-main flex-grow-1" onclick="goStep(3)"><i class="bi bi-arrow-right me-1"></i>Next: Create Account</button>
+    </div>
+  </div>
+
+  <!-- STEP 3: Account -->
+  <div id="s3" style="display:none">
+    <p style="font-size:.83rem;color:#64748b;margin-bottom:16px">Create your login credentials for the student portal.</p>
+    <div class="mb-3"><label class="form-label"><i class="bi bi-person me-1"></i>Username *</label>
+      <input class="form-control" id="ru" placeholder="Choose a unique username">
+      <div class="form-text">Use letters, numbers, underscores only.</div>
+    </div>
+    <div class="mb-3"><label class="form-label"><i class="bi bi-lock me-1"></i>Password *</label>
+      <input type="password" class="form-control" id="rpw" placeholder="At least 6 characters"></div>
+    <div class="mb-3"><label class="form-label"><i class="bi bi-lock-fill me-1"></i>Confirm Password *</label>
+      <input type="password" class="form-control" id="rpw2" onkeydown="if(event.key==='Enter')doRegister()"></div>
+    <div class="d-flex gap-2">
+      <button class="btn btn-back" onclick="goStep(2)"><i class="bi bi-arrow-left"></i></button>
+      <button class="btn btn-main flex-grow-1" onclick="doRegister()" id="rbtn"><i class="bi bi-person-check me-2"></i>Complete Registration</button>
+    </div>
+  </div>
+
+  <!-- SUCCESS -->
+  <div id="s4" style="display:none">
+    <div class="success-box">
+      <div class="check-icon"><i class="bi bi-check-lg"></i></div>
+      <h5 class="fw-bold">Registration Successful! 🎉</h5>
+      <p class="text-muted mt-2 mb-4">Your hostel account is ready. Login to view your room, fees and notices.</p>
+      <a href="/login" class="btn btn-main px-5"><i class="bi bi-box-arrow-in-right me-2"></i>Go to Login</a>
+    </div>
+  </div>
+</div>
+
+<script>
+let VD={}; let ST='fresher';
+function selType(t){
+  ST=t;
+  document.getElementById('btn-f').classList.toggle('sel',t==='fresher');
+  document.getElementById('btn-e').classList.toggle('sel',t==='existing');
+  document.getElementById('code-lbl').innerHTML=t==='fresher'
+    ?'<i class="bi bi-shield-lock me-1"></i>Admission / Counselling Receipt No. *'
+    :'<i class="bi bi-shield-lock me-1"></i>Student Roll No. *';
+  document.getElementById('vcode').placeholder=t==='fresher'?'e.g. ADM2026001':'e.g. S001';
+}
+function showErr(m){const e=document.getElementById('err-msg');document.getElementById('err-txt').textContent=m;e.style.display='block';setTimeout(()=>e.style.display='none',5000);}
+function goStep(n){
+  [1,2,3,4].forEach(i=>{const el=document.getElementById('s'+i);if(el)el.style.display=i===n?'block':'none';});
+  for(let i=1;i<=3;i++){
+    const sc=document.getElementById('sc'+i);
+    if(i<n){sc.className='sc done';sc.innerHTML='<i class="bi bi-check-lg"></i>';}
+    else if(i===n){sc.className='sc act';sc.innerHTML=i;}
+    else{sc.className='sc pend';sc.innerHTML=i;}
+  }
+  for(let i=1;i<=2;i++) document.getElementById('sl'+i).className='sl'+(i<n?' done':'');
+  if(n===4) document.getElementById('step-bar').style.display='none';
+  document.getElementById('err-msg').style.display='none';
+}
+async function verifyCode(){
+  const code=document.getElementById('vcode').value.trim();
+  if(!code){showErr('Please enter your verification code');return;}
+  const btn=document.getElementById('vbtn');
+  btn.disabled=true;btn.innerHTML='<span class="spinner-border spinner-border-sm me-2"></span>Verifying...';
+  try{
+    const r=await fetch('/api/verify-identity',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({verify_code:code})});
+    const d=await r.json();
+    if(!r.ok){showErr(d.error||'Verification failed');btn.disabled=false;btn.innerHTML='<i class="bi bi-shield-check me-2"></i>Verify Identity';return;}
+    VD=d;
+    document.getElementById('rn').value=d.name||'';
+    document.getElementById('re').value=d.email||'';
+    document.getElementById('rc').value=d.course||'';
+    document.getElementById('ry').value=String(d.year||'1');
+    document.getElementById('rg').value=d.gender||'Male';
+    document.getElementById('ok-msg').textContent='Welcome, '+d.name+'! Your '+(d.student_type==='fresher'?'admission number':'roll number')+' has been verified. Please complete your profile.';
+    goStep(2);
+  }catch(e){showErr('Server error. Please try again.');btn.disabled=false;btn.innerHTML='<i class="bi bi-shield-check me-2"></i>Verify Identity';}
+}
+async function doRegister(){
+  const u=document.getElementById('ru').value.trim();
+  const pw=document.getElementById('rpw').value;
+  const pw2=document.getElementById('rpw2').value;
+  if(!u){showErr('Username is required');return;}
+  if(!pw){showErr('Password is required');return;}
+  if(pw!==pw2){showErr('Passwords do not match');return;}
+  if(pw.length<6){showErr('Password must be at least 6 characters');return;}
+  const data={verify_code:VD.verify_code,username:u,password:pw,
+    name:document.getElementById('rn').value,email:document.getElementById('re').value,
+    phone:document.getElementById('rp').value,gender:document.getElementById('rg').value,
+    dob:document.getElementById('rd').value,course:document.getElementById('rc').value,
+    year:+document.getElementById('ry').value,address:document.getElementById('ra').value,
+    guardian_name:document.getElementById('rgn').value,guardian_phone:document.getElementById('rgp').value};
+  const btn=document.getElementById('rbtn');
+  btn.disabled=true;btn.innerHTML='<span class="spinner-border spinner-border-sm me-2"></span>Creating account...';
+  try{
+    const r=await fetch('/api/self-register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    const d=await r.json();
+    if(!r.ok){showErr(d.error||'Registration failed');btn.disabled=false;btn.innerHTML='<i class="bi bi-person-check me-2"></i>Complete Registration';return;}
+    goStep(4);
+  }catch(e){showErr('Server error. Please try again.');btn.disabled=false;btn.innerHTML='<i class="bi bi-person-check me-2"></i>Complete Registration';}
+}
 </script>
 </body></html>"""
 

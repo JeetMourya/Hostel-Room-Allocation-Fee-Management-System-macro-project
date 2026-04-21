@@ -1,0 +1,8 @@
+verify_code,student_type,name,email,course,year,gender
+ADM2026005,fresher,Karan Mehta,karan@college.edu,B.Tech IT,1,Male
+ADM2026006,fresher,Divya Rao,divya@college.edu,MBA,1,Female
+ADM2026007,senior,Rohit Bansal,rohit@college.edu,BBA,2,Male
+ADM2026008,fresher,Anjali Mishra,anjali@college.edu,B.Sc CS,1,Female
+ROLL2026A01,fresher,Dev Sharma,dev@college.edu,B.Tech Civil,1,Male
+ROLL2026A02,senior,Meera Nair,meera@college.edu,B.Sc Physics,2,Female
+ROLL2026S03,senior,Arjun Gupta,arjun@college.edu,B.Tech ME,3,Male
